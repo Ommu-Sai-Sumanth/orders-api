@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from typing import Optional
@@ -9,9 +9,9 @@ import base64
 app = FastAPI()
 
 
-# -------------------------
+# -----------------------------
 # CORS
-# -------------------------
+# -----------------------------
 
 app.add_middleware(
     CORSMiddleware,
@@ -23,41 +23,42 @@ app.add_middleware(
 )
 
 
-# -------------------------
+# -----------------------------
 # Configuration
-# -------------------------
+# -----------------------------
 
 TOTAL_ORDERS = 47
 RATE_LIMIT = 17
 RATE_WINDOW = 10
 
 
-# -------------------------
+# -----------------------------
 # Storage
-# -------------------------
+# -----------------------------
 
-# Stores idempotency key -> created order
+# Idempotency-Key -> order response
 idempotency_store = {}
 
-# Fixed order catalog 1..47
-orders = {
-    i: {
+# Fixed catalog 1..47
+orders = [
+    {
         "id": i,
         "name": f"Order {i}"
     }
     for i in range(1, TOTAL_ORDERS + 1)
-}
-
-# Client ID -> request timestamps
-rate_limit_store = {}
+]
 
 
-# -------------------------
+# X-Client-Id -> timestamps
+client_requests = {}
+
+
+# -----------------------------
 # Rate limiting middleware
-# -------------------------
+# -----------------------------
 
 @app.middleware("http")
-async def rate_limiter(request: Request, call_next):
+async def rate_limit(request: Request, call_next):
 
     client_id = request.headers.get(
         "X-Client-Id",
@@ -66,72 +67,79 @@ async def rate_limiter(request: Request, call_next):
 
     now = time.time()
 
-    if client_id not in rate_limit_store:
-        rate_limit_store[client_id] = []
+    if client_id not in client_requests:
+        client_requests[client_id] = []
 
-    # Remove requests outside 10 second window
-    rate_limit_store[client_id] = [
-        timestamp
-        for timestamp in rate_limit_store[client_id]
-        if now - timestamp < RATE_WINDOW
+
+    # Keep only requests inside last 10 seconds
+    client_requests[client_id] = [
+        t for t in client_requests[client_id]
+        if now - t < RATE_WINDOW
     ]
 
-    # Check limit
-    if len(rate_limit_store[client_id]) >= RATE_LIMIT:
+
+    if len(client_requests[client_id]) >= RATE_LIMIT:
         return JSONResponse(
             status_code=429,
             content={
-                "error": "Rate limit exceeded"
+                "detail": "Rate limit exceeded"
             },
             headers={
                 "Retry-After": str(RATE_WINDOW)
             }
         )
 
-    rate_limit_store[client_id].append(now)
+
+    client_requests[client_id].append(now)
 
     return await call_next(request)
 
 
-# -------------------------
-# Idempotent order creation
-# -------------------------
+
+# -----------------------------
+# POST /orders
+# Idempotent creation
+# -----------------------------
 
 @app.post("/orders", status_code=201)
 def create_order(
-    Idempotency_Key: Optional[str] = Header(None)
+    idempotency_key: Optional[str] = Header(
+        None,
+        alias="Idempotency-Key"
+    )
 ):
 
-    if not Idempotency_Key:
-        raise HTTPException(
+    if not idempotency_key:
+        return JSONResponse(
             status_code=400,
-            detail="Missing Idempotency-Key"
+            content={
+                "detail": "Missing Idempotency-Key"
+            }
         )
 
 
-    # Return existing order for same key
-    if Idempotency_Key in idempotency_store:
-        return idempotency_store[Idempotency_Key]
+    # Return previous result
+    if idempotency_key in idempotency_store:
+        return idempotency_store[idempotency_key]
 
 
     # Create new order
-    order_id = str(
-        1000 + len(idempotency_store)
-    )
-
-    order = {
-        "id": order_id,
+    new_order = {
+        "id": str(len(idempotency_store) + 1),
         "status": "created"
     }
 
-    idempotency_store[Idempotency_Key] = order
 
-    return order
+    idempotency_store[idempotency_key] = new_order
+
+    return new_order
 
 
-# -------------------------
+
+# -----------------------------
+# GET /orders
 # Cursor pagination
-# -------------------------
+# -----------------------------
 
 @app.get("/orders")
 def get_orders(
@@ -143,44 +151,34 @@ def get_orders(
         limit = 10
 
 
+    start_index = 0
+
+
     # Decode cursor
     if cursor:
         try:
-            start_id = int(
+            start_index = int(
                 base64.b64decode(cursor).decode()
             )
         except Exception:
-            start_id = 1
-    else:
-        start_id = 1
+            start_index = 0
 
 
-    # Prevent invalid start
-    if start_id > TOTAL_ORDERS:
-        return {
-            "items": [],
-            "next_cursor": None
-        }
-
-
-    end_id = min(
-        start_id + limit - 1,
+    end_index = min(
+        start_index + limit,
         TOTAL_ORDERS
     )
 
 
-    items = [
-        orders[i]
-        for i in range(start_id, end_id + 1)
-    ]
+    items = orders[start_index:end_index]
 
 
-    if end_id < TOTAL_ORDERS:
+    next_cursor = None
+
+    if end_index < TOTAL_ORDERS:
         next_cursor = base64.b64encode(
-            str(end_id + 1).encode()
+            str(end_index).encode()
         ).decode()
-    else:
-        next_cursor = None
 
 
     return {
