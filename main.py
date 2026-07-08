@@ -33,11 +33,14 @@ RATE_WINDOW = 10
 
 
 # -----------------------------
-# Storage
+# In-memory storage
 # -----------------------------
 
-# Idempotency-Key -> order response
+# Idempotency-Key -> response
 idempotency_store = {}
+
+# Client ID -> request timestamps
+client_requests = {}
 
 # Fixed catalog 1..47
 orders = [
@@ -49,16 +52,16 @@ orders = [
 ]
 
 
-# X-Client-Id -> timestamps
-client_requests = {}
-
-
 # -----------------------------
-# Rate limiting middleware
+# Rate limiting
 # -----------------------------
 
 @app.middleware("http")
 async def rate_limit(request: Request, call_next):
+
+    # Allow CORS preflight requests
+    if request.method == "OPTIONS":
+        return await call_next(request)
 
     client_id = request.headers.get(
         "X-Client-Id",
@@ -71,13 +74,15 @@ async def rate_limit(request: Request, call_next):
         client_requests[client_id] = []
 
 
-    # Keep only requests inside last 10 seconds
+    # Remove expired requests
     client_requests[client_id] = [
-        t for t in client_requests[client_id]
-        if now - t < RATE_WINDOW
+        timestamp
+        for timestamp in client_requests[client_id]
+        if now - timestamp < RATE_WINDOW
     ]
 
 
+    # Block after 17 requests
     if len(client_requests[client_id]) >= RATE_LIMIT:
         return JSONResponse(
             status_code=429,
@@ -85,7 +90,7 @@ async def rate_limit(request: Request, call_next):
                 "detail": "Rate limit exceeded"
             },
             headers={
-                "Retry-After": str(RATE_WINDOW)
+                "Retry-After": "10"
             }
         )
 
@@ -118,12 +123,11 @@ def create_order(
         )
 
 
-    # Return previous result
+    # Return same order for repeated key
     if idempotency_key in idempotency_store:
         return idempotency_store[idempotency_key]
 
 
-    # Create new order
     new_order = {
         "id": str(len(idempotency_store) + 1),
         "status": "created"
@@ -154,7 +158,6 @@ def get_orders(
     start_index = 0
 
 
-    # Decode cursor
     if cursor:
         try:
             start_index = int(
