@@ -2,189 +2,123 @@ from fastapi import FastAPI, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from typing import Optional
-import time
 import base64
-
+import time
 
 app = FastAPI()
 
-
-# -----------------------------
+# -----------------------
 # CORS
-# -----------------------------
-
+# -----------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["Retry-After"],
 )
 
-
-# -----------------------------
-# Configuration
-# -----------------------------
-
 TOTAL_ORDERS = 47
 RATE_LIMIT = 17
-RATE_WINDOW = 10
+WINDOW = 10
 
-
-# -----------------------------
-# In-memory storage
-# -----------------------------
-
-# Idempotency-Key -> response
-idempotency_store = {}
-
-# Client ID -> request timestamps
-client_requests = {}
-
-# Fixed catalog 1..47
+# Fixed catalog
 orders = [
-    {
-        "id": i,
-        "name": f"Order {i}"
-    }
+    {"id": i, "name": f"Order {i}"}
     for i in range(1, TOTAL_ORDERS + 1)
 ]
 
+# Idempotency storage
+idempotency = {}
 
-# -----------------------------
-# Rate limiting
-# -----------------------------
+# Rate-limit buckets
+buckets = {}
+
 
 @app.middleware("http")
 async def rate_limit(request: Request, call_next):
-
-    # Allow CORS preflight requests
+    # Never rate limit CORS preflight
     if request.method == "OPTIONS":
         return await call_next(request)
 
-    client_id = request.headers.get(
-        "X-Client-Id",
-        "anonymous"
-    )
+    client = request.headers.get("X-Client-Id")
 
-    now = time.time()
+    # Requirement says rate limit per client ID.
+    # If header isn't present, don't bucket the request.
+    if client:
+        now = time.time()
 
-    if client_id not in client_requests:
-        client_requests[client_id] = []
+        history = buckets.setdefault(client, [])
 
+        history[:] = [t for t in history if now - t < WINDOW]
 
-    # Remove expired requests
-    client_requests[client_id] = [
-        timestamp
-        for timestamp in client_requests[client_id]
-        if now - timestamp < RATE_WINDOW
-    ]
+        if len(history) >= RATE_LIMIT:
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Rate limit exceeded"},
+                headers={"Retry-After": "10"},
+            )
 
-
-    # Block after 17 requests
-    if len(client_requests[client_id]) >= RATE_LIMIT:
-        return JSONResponse(
-            status_code=429,
-            content={
-                "detail": "Rate limit exceeded"
-            },
-            headers={
-                "Retry-After": "10"
-            }
-        )
-
-
-    client_requests[client_id].append(now)
+        history.append(now)
 
     return await call_next(request)
 
 
-
-# -----------------------------
-# POST /orders
-# Idempotent creation
-# -----------------------------
-
 @app.post("/orders", status_code=201)
 def create_order(
     idempotency_key: Optional[str] = Header(
-        None,
-        alias="Idempotency-Key"
+        default=None,
+        alias="Idempotency-Key",
     )
 ):
-
-    if not idempotency_key:
+    if idempotency_key is None:
         return JSONResponse(
             status_code=400,
-            content={
-                "detail": "Missing Idempotency-Key"
-            }
+            content={"detail": "Missing Idempotency-Key"},
         )
 
+    if idempotency_key in idempotency:
+        return idempotency[idempotency_key]
 
-    # Return same order for repeated key
-    if idempotency_key in idempotency_store:
-        return idempotency_store[idempotency_key]
-
-
-    new_order = {
-        "id": str(len(idempotency_store) + 1),
-        "status": "created"
+    order = {
+        "id": str(len(idempotency) + 1)
     }
 
+    idempotency[idempotency_key] = order
 
-    idempotency_store[idempotency_key] = new_order
+    return order
 
-    return new_order
-
-
-
-# -----------------------------
-# GET /orders
-# Cursor pagination
-# -----------------------------
 
 @app.get("/orders")
 def get_orders(
     limit: int = 10,
-    cursor: Optional[str] = None
+    cursor: Optional[str] = None,
 ):
-
     if limit < 1:
-        limit = 10
+        limit = 1
 
-
-    start_index = 0
-
+    start = 0
 
     if cursor:
         try:
-            start_index = int(
+            start = int(
                 base64.b64decode(cursor).decode()
             )
         except Exception:
-            start_index = 0
+            start = 0
 
+    end = min(start + limit, TOTAL_ORDERS)
 
-    end_index = min(
-        start_index + limit,
-        TOTAL_ORDERS
-    )
-
-
-    items = orders[start_index:end_index]
-
+    items = orders[start:end]
 
     next_cursor = None
 
-    if end_index < TOTAL_ORDERS:
+    if end < TOTAL_ORDERS:
         next_cursor = base64.b64encode(
-            str(end_index).encode()
+            str(end).encode()
         ).decode()
-
 
     return {
         "items": items,
-        "next_cursor": next_cursor
+        "next_cursor": next_cursor,
     }
