@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from typing import Optional
 import time
 import base64
@@ -8,8 +9,9 @@ import base64
 app = FastAPI()
 
 
-# Allow browser grader access
-
+# -------------------------
+# CORS
+# -------------------------
 
 app.add_middleware(
     CORSMiddleware,
@@ -19,23 +21,23 @@ app.add_middleware(
 )
 
 
-# ----------------------------
+# -------------------------
 # Configuration
-# ----------------------------
+# -------------------------
 
 TOTAL_ORDERS = 47
 RATE_LIMIT = 17
 RATE_WINDOW = 10
 
 
-# ----------------------------
+# -------------------------
 # Storage
-# ----------------------------
+# -------------------------
 
-# Idempotency storage
+# Stores idempotency key -> created order
 idempotency_store = {}
 
-# Fake order database
+# Fixed order catalog 1..47
 orders = {
     i: {
         "id": i,
@@ -44,17 +46,16 @@ orders = {
     for i in range(1, TOTAL_ORDERS + 1)
 }
 
+# Client ID -> request timestamps
+rate_limit_store = {}
 
-# Rate limit storage
-client_requests = {}
 
-
-# ----------------------------
-# Rate limiter middleware
-# ----------------------------
+# -------------------------
+# Rate limiting middleware
+# -------------------------
 
 @app.middleware("http")
-async def rate_limit(request: Request, call_next):
+async def rate_limiter(request: Request, call_next):
 
     client_id = request.headers.get(
         "X-Client-Id",
@@ -63,41 +64,36 @@ async def rate_limit(request: Request, call_next):
 
     now = time.time()
 
-    if client_id not in client_requests:
-        client_requests[client_id] = []
+    if client_id not in rate_limit_store:
+        rate_limit_store[client_id] = []
 
-    # remove expired requests
-    client_requests[client_id] = [
-        t for t in client_requests[client_id]
-        if now - t < RATE_WINDOW
+    # Remove requests outside 10 second window
+    rate_limit_store[client_id] = [
+        timestamp
+        for timestamp in rate_limit_store[client_id]
+        if now - timestamp < RATE_WINDOW
     ]
 
-    if len(client_requests[client_id]) >= RATE_LIMIT:
-        response = HTTPException(
-            status_code=429,
-            detail="Rate limit exceeded"
-        )
-
-        from fastapi.responses import JSONResponse
-
+    # Check limit
+    if len(rate_limit_store[client_id]) >= RATE_LIMIT:
         return JSONResponse(
             status_code=429,
             content={
-                "error": "Too many requests"
+                "error": "Rate limit exceeded"
             },
             headers={
                 "Retry-After": str(RATE_WINDOW)
             }
         )
 
-    client_requests[client_id].append(now)
+    rate_limit_store[client_id].append(now)
 
     return await call_next(request)
 
 
-# ----------------------------
-# Idempotent POST /orders
-# ----------------------------
+# -------------------------
+# Idempotent order creation
+# -------------------------
 
 @app.post("/orders", status_code=201)
 def create_order(
@@ -111,67 +107,75 @@ def create_order(
         )
 
 
-    # Existing request
+    # Return existing order for same key
     if Idempotency_Key in idempotency_store:
         return idempotency_store[Idempotency_Key]
 
 
     # Create new order
-    new_id = len(idempotency_store) + 1000
+    order_id = str(
+        1000 + len(idempotency_store)
+    )
 
     order = {
-        "id": str(new_id),
+        "id": order_id,
         "status": "created"
     }
-
 
     idempotency_store[Idempotency_Key] = order
 
     return order
 
 
-
-# ----------------------------
+# -------------------------
 # Cursor pagination
-# ----------------------------
+# -------------------------
 
 @app.get("/orders")
-def list_orders(
+def get_orders(
     limit: int = 10,
     cursor: Optional[str] = None
 ):
 
-    if limit <= 0:
+    if limit < 1:
         limit = 10
 
 
     # Decode cursor
     if cursor:
         try:
-            start = int(
+            start_id = int(
                 base64.b64decode(cursor).decode()
             )
-        except:
-            start = 1
+        except Exception:
+            start_id = 1
     else:
-        start = 1
+        start_id = 1
 
 
-    end = min(
-        start + limit - 1,
+    # Prevent invalid start
+    if start_id > TOTAL_ORDERS:
+        return {
+            "items": [],
+            "next_cursor": None
+        }
+
+
+    end_id = min(
+        start_id + limit - 1,
         TOTAL_ORDERS
     )
 
 
     items = [
         orders[i]
-        for i in range(start, end + 1)
+        for i in range(start_id, end_id + 1)
     ]
 
 
-    if end < TOTAL_ORDERS:
+    if end_id < TOTAL_ORDERS:
         next_cursor = base64.b64encode(
-            str(end + 1).encode()
+            str(end_id + 1).encode()
         ).decode()
     else:
         next_cursor = None
